@@ -2,12 +2,15 @@
 #import <RootBridge.h>
 #import "../common.h"
 
-@implementation ShadowSettings
+@implementation ShadowSettings {
+    NSDictionary* _effectivePList; // Direct file fallback
+}
+
 @synthesize defaultSettings, userDefaults;
 
 - (instancetype)init {
     if((self = [super init])) {
-        // Define original default behavior
+        // 1. Define Master Defaults
         defaultSettings = @{
             @"Global_Enabled" : @(NO),
             @"HK_Library" : @"fishhook",
@@ -31,70 +34,51 @@
             @"Hook_HideApps" : @(NO)
         };
 
-        // iOS 16 Rootless optimization:
-        // Use RootBridge to locate the preference file path correctly
+        // 2. Resolve Preference Path for Rootless
         NSString* prefPath = [RootBridge rootPath:@SHADOW_PREFS_PLIST];
         
-        // Initialize userDefaults using the corrected path for rootless environments
-        userDefaults = [[NSUserDefaults alloc] initWithSuiteName:prefPath];
+        // 3. Initialize Suite. Note: SuiteName should be the domain, 
+        // but we keep the suite logic and add a Direct Read fallback.
+        userDefaults = [[NSUserDefaults alloc] initWithSuiteName:@"com.jjolano.shadow"];
         [userDefaults registerDefaults:defaultSettings];
-    }
 
+        // 4. Hardened Fallback: Load Plist directly if NSUserDefaults is restricted
+        if (prefPath && [[NSFileManager defaultManager] isReadableFileAtPath:prefPath]) {
+            _effectivePList = [NSDictionary dictionaryWithContentsOfFile:prefPath];
+        }
+    }
     return self;
 }
 
 + (instancetype)sharedInstance {
     static ShadowSettings* sharedInstance = nil;
-    static dispatch_once_t onceToken = 0;
-
+    static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         sharedInstance = [self new];
     });
-
     return sharedInstance;
 }
 
 - (NSDictionary<NSString *, id> *)getPreferencesForIdentifier:(NSString *)bundleIdentifier {
-    if(!userDefaults) {
-        return defaultSettings;
+    NSMutableDictionary* result = [defaultSettings mutableCopy];
+    
+    // Attempt to get settings from Suite, then Fallback Plist
+    NSDictionary* globalSettings = [userDefaults dictionaryRepresentation];
+    if (![globalSettings objectForKey:@"Global_Enabled"] && _effectivePList) {
+        globalSettings = _effectivePList;
     }
 
-    NSMutableDictionary* result = [defaultSettings mutableCopy];
-    NSDictionary* app_settings = bundleIdentifier ? [userDefaults objectForKey:bundleIdentifier] : nil;
+    NSDictionary* appSettings = bundleIdentifier ? [globalSettings objectForKey:bundleIdentifier] : nil;
 
-    BOOL useAppSettings = [[app_settings objectForKey:@"App_Enabled"] boolValue];
-
-    if(useAppSettings) {
-        // Use app overrides.
+    // Check if App-Specific settings should be used
+    if([[appSettings objectForKey:@"App_Enabled"] boolValue]) {
+        [result addEntriesFromDictionary:appSettings];
+    } 
+    // Otherwise, check if Global settings are enabled
+    else if([[globalSettings objectForKey:@"Global_Enabled"] boolValue]) {
+        [result addEntriesFromDictionary:globalSettings];
+        // Ensure "App_Enabled" key exists for the engine's check
         [result setObject:@(YES) forKey:@"App_Enabled"];
-
-        for(NSString* key in defaultSettings) {
-            id value = [app_settings objectForKey:key];
-
-            if(!value) {
-                id defaultValue = @(NO);
-
-                if([[defaultSettings objectForKey:key] isKindOfClass:[NSString class]]) {
-                    defaultValue = [defaultSettings objectForKey:key];
-                }
-
-                value = defaultValue;
-            }
-            
-            [result setObject:value forKey:key];
-        }
-    } else {
-        // Use global defaults.
-        if([userDefaults boolForKey:@"Global_Enabled"]) {
-            [result setObject:@(YES) forKey:@"App_Enabled"];
-
-            for(NSString* key in defaultSettings) {
-                id value = [userDefaults objectForKey:key];
-                if(value) {
-                    [result setObject:value forKey:key];
-                }
-            }
-        }
     }
 
     return [result copy];
