@@ -13,6 +13,11 @@ FINALPACKAGE = 1
 
 include $(THEOS)/makefiles/common.mk
 
+# Global flags to ensure all subprojects link correctly
+# -lsubstrate is required for the Library Masking hooks
+# -lRootBridge is required for rootless path redirection
+export COMMON_LDFLAGS = -lsubstrate -lRootBridge
+
 # List of sub-components to build
 SUBPROJECTS += Shadow.framework
 SUBPROJECTS += Shadow.dylib
