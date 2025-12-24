@@ -4,10 +4,37 @@
 #import <RootBridge.h>
 #import <dlfcn.h>
 #import <pwd.h>
+#import <mach-o/dyld.h>
+#import <substrate.h> // Ensure you have libsubstrate/CydiaSubstrate
 #import "../vendor/apple/dyld_priv.h"
 
+// --- [NEW] LIBRARY MASKING ENGINE GLOBALS ---
+static uint32_t (*orig_dyld_image_count)(void);
+static const char* (*orig_dyld_get_image_name)(uint32_t image_index);
+static const struct mach_header* (*orig_dyld_get_image_header)(uint32_t image_index);
+static uint32_t shadow_index = -1;
+
+// Hooked functions to "skip" Shadow in the list
+uint32_t hooked_dyld_image_count(void) {
+    uint32_t count = orig_dyld_image_count();
+    return (shadow_index != -1) ? (count - 1) : count;
+}
+
+const char* hooked_dyld_get_image_name(uint32_t image_index) {
+    if (shadow_index != -1 && image_index >= shadow_index) {
+        return orig_dyld_get_image_name(image_index + 1);
+    }
+    return orig_dyld_get_image_name(image_index);
+}
+
+const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
+    if (shadow_index != -1 && image_index >= shadow_index) {
+        return orig_dyld_get_image_header(image_index + 1);
+    }
+    return orig_dyld_get_image_header(image_index);
+}
+
 @implementation Shadow {
-    // Advanced Memory Cache for high-speed lookups
     NSCache* pathCache;
 }
 
@@ -15,29 +42,43 @@
 
 - (instancetype)init {
     if((self = [super init])) {
+        // 1. Path Setup
         bundlePath = [[[self class] getExecutablePath] stringByDeletingLastPathComponent];
         homePath = NSHomeDirectory();
         realHomePath = @(getpwuid(getuid())->pw_dir);
-
         bundlePath = [[self class] getStandardizedPath:bundlePath];
         homePath = [[self class] getStandardizedPath:homePath];
         realHomePath = [[self class] getStandardizedPath:realHomePath];
-
         hasAppSandbox = [[bundlePath pathExtension] isEqualToString:@"app"];
         
-        // Rootless Detection
+        // 2. Rootless Detection
         rootless = [RootBridge isJBRootless];
         if(!rootless) {
             rootless = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"];
         }
 
-        // Initialize Performance Cache
+        // 3. Initialize Performance Cache
         pathCache = [NSCache new];
-        [pathCache setCountLimit:1500]; // Optimal balance for iOS 16 RAM management
+        [pathCache setCountLimit:1500];
 
         backend = [ShadowBackend new];
-    }
 
+        // 4. [NEW] Initialize Library Masking
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const char* name = _dyld_get_image_name(i);
+            if (name && (strstr(name, "Shadow.dylib") || strstr(name, "RootBridge"))) {
+                shadow_index = i;
+                break;
+            }
+        }
+
+        if (shadow_index != -1) {
+            MSHookFunction((void *)_dyld_image_count, (void *)hooked_dyld_image_count, (void **)&orig_dyld_image_count);
+            MSHookFunction((void *)_dyld_get_image_name, (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+            MSHookFunction((void *)_dyld_get_image_header, (void *)hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+        }
+    }
     return self;
 }
 
@@ -86,7 +127,6 @@
         return NO;
     }
 
-    // Performance Shortcut: Check Memory Cache first
     if(!options) {
         NSNumber* cached = [pathCache objectForKey:path];
         if(cached) return [cached boolValue];
@@ -125,7 +165,6 @@
             restricted = YES;
         }
 
-        // Special handling for dynamic library paths
         if(!restricted && [path hasPrefix:@"/usr/lib"]) {
             int errno_old = errno;
             if(access([path fileSystemRepresentation], F_OK) != 0) {
@@ -135,7 +174,6 @@
         }
     }
 
-    // Recursive Resolve
     if(!restricted && (![options objectForKey:kShadowRestrictionEnableResolve] || [[options objectForKey:kShadowRestrictionEnableResolve] boolValue])) {
         NSString* resolved_path = [path stringByStandardizingPath];
         if(![resolved_path isEqualToString:path]) {
@@ -145,7 +183,6 @@
         }
     }
 
-    // Save result to Cache for next time
     if(!options) {
         [pathCache setObject:@(restricted) forKey:path];
     }
