@@ -5,33 +5,56 @@
 #import <dlfcn.h>
 #import <pwd.h>
 #import <mach-o/dyld.h>
-#import <substrate.h> // Ensure you have libsubstrate/CydiaSubstrate
+#import <substrate.h>
+#import <sys/types.h>
 #import "../vendor/apple/dyld_priv.h"
 
-// --- [NEW] LIBRARY MASKING ENGINE GLOBALS ---
+// --- STEALTH ENGINE GLOBALS ---
+#define PT_DENY_ATTACH 31
+typedef int (*ptrace_ptr_t)(int request, pid_t pid, caddr_t addr, int data);
+static ptrace_ptr_t orig_ptrace = NULL;
+
 static uint32_t (*orig_dyld_image_count)(void);
 static const char* (*orig_dyld_get_image_name)(uint32_t image_index);
 static const struct mach_header* (*orig_dyld_get_image_header)(uint32_t image_index);
-static uint32_t shadow_index = -1;
 
-// Hooked functions to "skip" Shadow in the list
+// Improvement 1 & 2: Static array (no leak) and masked index management
+static uint32_t masked_indices[16]; // Fixed limit is safer for system tweaks
+static uint32_t masked_count = 0;
+
+// Stealth Hook: ptrace (Anti-Debugging)
+int hooked_ptrace(int request, pid_t pid, caddr_t addr, int data) {
+    if (request == PT_DENY_ATTACH) {
+        return 0; // Fake success
+    }
+    return orig_ptrace(request, pid, addr, data);
+}
+
+// Stealth Hooks: dyld (Multi-Library Masking)
 uint32_t hooked_dyld_image_count(void) {
-    uint32_t count = orig_dyld_image_count();
-    return (shadow_index != -1) ? (count - 1) : count;
+    uint32_t real_count = orig_dyld_image_count();
+    // Improvement 3: Underflow protection
+    if (real_count <= masked_count) return real_count; 
+    return real_count - masked_count;
+}
+
+// Helper to translate virtual index to actual system index
+static uint32_t translate_index(uint32_t virtual_index) {
+    uint32_t actual_index = virtual_index;
+    for (uint32_t i = 0; i < masked_count; i++) {
+        if (actual_index >= masked_indices[i]) {
+            actual_index++;
+        }
+    }
+    return actual_index;
 }
 
 const char* hooked_dyld_get_image_name(uint32_t image_index) {
-    if (shadow_index != -1 && image_index >= shadow_index) {
-        return orig_dyld_get_image_name(image_index + 1);
-    }
-    return orig_dyld_get_image_name(image_index);
+    return orig_dyld_get_image_name(translate_index(image_index));
 }
 
 const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
-    if (shadow_index != -1 && image_index >= shadow_index) {
-        return orig_dyld_get_image_header(image_index + 1);
-    }
-    return orig_dyld_get_image_header(image_index);
+    return orig_dyld_get_image_header(translate_index(image_index));
 }
 
 @implementation Shadow {
@@ -42,13 +65,15 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
 
 - (instancetype)init {
     if((self = [super init])) {
-        // 1. Path Setup
+        // 1. Initialize Paths
         bundlePath = [[[self class] getExecutablePath] stringByDeletingLastPathComponent];
         homePath = NSHomeDirectory();
         realHomePath = @(getpwuid(getuid())->pw_dir);
+
         bundlePath = [[self class] getStandardizedPath:bundlePath];
         homePath = [[self class] getStandardizedPath:homePath];
         realHomePath = [[self class] getStandardizedPath:realHomePath];
+
         hasAppSandbox = [[bundlePath pathExtension] isEqualToString:@"app"];
         
         // 2. Rootless Detection
@@ -63,20 +88,30 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
 
         backend = [ShadowBackend new];
 
-        // 4. [NEW] Initialize Library Masking
+        // 4. Initialize Stealth Hooks (Multi-Masking with Sorted Indices)
         uint32_t count = _dyld_image_count();
-        for (uint32_t i = 0; i < count; i++) {
+        masked_count = 0;
+        
+        for (uint32_t i = 0; i < count && masked_count < 16; i++) {
             const char* name = _dyld_get_image_name(i);
-            if (name && (strstr(name, "Shadow.dylib") || strstr(name, "RootBridge"))) {
-                shadow_index = i;
-                break;
+            if (name && (strstr(name, "Shadow.dylib") || strstr(name, "RootBridge") || strstr(name, "libsubstrate"))) {
+                masked_indices[masked_count++] = i;
             }
         }
+        
+        // Improvement 2 Fix: Ensure masked_indices are sorted for the translation logic
+        // (They are naturally sorted here because we iterate i from 0 to count)
 
-        if (shadow_index != -1) {
+        if (masked_count > 0) {
             MSHookFunction((void *)_dyld_image_count, (void *)hooked_dyld_image_count, (void **)&orig_dyld_image_count);
             MSHookFunction((void *)_dyld_get_image_name, (void *)hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
             MSHookFunction((void *)_dyld_get_image_header, (void *)hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+        }
+
+        // Improvement 3 Fix: Stable ptrace Hooking using RTLD_DEFAULT
+        void* ptrace_addr = dlsym(RTLD_DEFAULT, "ptrace");
+        if (ptrace_addr) {
+            MSHookFunction(ptrace_addr, (void *)hooked_ptrace, (void **)&orig_ptrace);
         }
     }
     return self;
@@ -127,9 +162,12 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
         return NO;
     }
 
+    // Improvement 1: Thread-Safe Cache Access
     if(!options) {
-        NSNumber* cached = [pathCache objectForKey:path];
-        if(cached) return [cached boolValue];
+        @synchronized(pathCache) {
+            NSNumber* cached = [pathCache objectForKey:path];
+            if(cached) return [cached boolValue];
+        }
     }
 
     path = [path stringByExpandingTildeInPath];
@@ -183,8 +221,11 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
         }
     }
 
+    // Improvement 1: Thread-Safe Cache Set
     if(!options) {
-        [pathCache setObject:@(restricted) forKey:path];
+        @synchronized(pathCache) {
+            [pathCache setObject:@(restricted) forKey:path];
+        }
     }
 
     return restricted;
@@ -192,6 +233,19 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
 
 - (BOOL)isURLRestricted:(NSURL *)url {
     return [self isURLRestricted:url options:nil];
+}
+
+- (BOOL)isURLRestricted:(NSURL *)url options:(NSDictionary<NSString *, id> *)options {
+    if(!url) return NO;
+    if([url isFileURL]) {
+        NSString *path = [url path];
+        if([url isFileReferenceURL]) {
+            NSURL *surl = [url filePathURL];
+            if(surl) path = [surl path];
+        }
+        return [self isPathRestricted:path options:options];
+    }
+    return [self isSchemeRestricted:[url scheme]];
 }
 
 - (BOOL)isURLRestricted:(NSURL *)url options:(NSDictionary<NSString *, id> *)options {
