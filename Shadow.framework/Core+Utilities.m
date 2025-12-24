@@ -1,7 +1,6 @@
 #import <Shadow/Core+Utilities.h>
 #import <Shadow/Ruleset.h>
 #import <RootBridge.h>
-
 #import "../vendor/apple/dyld_priv.h"
 #import "../common.h"
 
@@ -10,22 +9,19 @@ extern char*** _NSGetArgv();
 @implementation Shadow (Utilities)
 
 + (NSString *)getStandardizedPath:(NSString *)path {
-    if(!path) {
+    if(!path || [path length] == 0) {
         return path;
     }
 
-    NSURL* url = [NSURL URLWithString:path];
-
-    if(!url) {
-        url = [NSURL fileURLWithPath:path];
-    }
-
-    NSString* standardized_path = [[url standardizedURL] path];
+    // Standardize using URL logic to resolve basic separators
+    NSURL* url = [NSURL fileURLWithPath:path];
+    NSString* standardized_path = [url path];
 
     if(standardized_path) {
         path = standardized_path;
     }
 
+    // Clean up redundant separators
     while([path containsString:@"/./"]) {
         path = [path stringByReplacingOccurrencesOfString:@"/./" withString:@"/"];
     }
@@ -42,31 +38,18 @@ extern char*** _NSGetArgv();
         while([path hasSuffix:@"/."]) {
             path = [path stringByDeletingLastPathComponent];
         }
-        
-        while([path hasSuffix:@"/.."]) {
-            path = [path stringByDeletingLastPathComponent];
-            path = [path stringByDeletingLastPathComponent];
-        }
     }
 
+    // Rootless/iOS 16 Fix: Standardize /private/ prefixes
     if([path hasPrefix:@"/private/var"] || [path hasPrefix:@"/private/etc"]) {
         NSMutableArray* pathComponents = [[path pathComponents] mutableCopy];
-        [pathComponents removeObjectAtIndex:1];
-        path = [NSString pathWithComponents:pathComponents];
-    }
-
-    if([path hasPrefix:@"/var/tmp"]) {
-        NSMutableArray* pathComponents = [[path pathComponents] mutableCopy];
-        [pathComponents removeObjectAtIndex:1];
+        [pathComponents removeObjectAtIndex:1]; // Remove 'private'
         path = [NSString pathWithComponents:pathComponents];
     }
 
     return path;
 }
 
-// code from Choicy
-//methods of getting executablePath and bundleIdentifier with the least side effects possible
-//for more information, check out https://github.com/checkra1n/BugTracker/issues/343
 + (NSString *)getExecutablePath {
     char* executablePathC = **_NSGetArgv();
     return executablePathC ? @(executablePathC) : nil;
@@ -78,19 +61,17 @@ extern char*** _NSGetArgv();
 }
 
 + (NSDictionary *)generateDatabase {
-    // Determine dpkg info database path.
+    // Determine dpkg info database path for iOS 16 Rootless
     NSArray* dpkgInfoPaths = @[
+        @"/var/jb/var/lib/dpkg/info",
         @"/Library/dpkg/info",
         @"/var/lib/dpkg/info"
     ];
 
     NSString* dpkgInfoPath = nil;
-
     for(NSString* path in dpkgInfoPaths) {
-        NSString* path_r = [RootBridge getJBPath:path];
-
-        if([[NSFileManager defaultManager] fileExistsAtPath:path_r]) {
-            dpkgInfoPath = path_r;
+        if([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            dpkgInfoPath = path;
             break;
         }
     }
@@ -99,93 +80,56 @@ extern char*** _NSGetArgv();
         return nil;
     }
 
-    // // Load standard (built-in) ruleset.
-    // NSString* ruleset_path = [@SHADOW_RULESETS stringByAppendingPathComponent:@"StandardRules.plist"];
-    // ShadowRuleset* ruleset = [ShadowRuleset rulesetWithPath:[RootBridge getJBPath:ruleset_path]];
-
-    NSArray* db_list_skip = @[@"base.list", @"firmware-sbin.list"];
-
     NSMutableSet* db_installed = [NSMutableSet new];
     NSMutableSet* db_exception = [NSMutableSet new];
     NSMutableSet* schemes = [NSMutableSet new];
 
-    // Iterate all list files in database.
     NSArray* db_files = [[NSFileManager defaultManager] contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dpkgInfoPath isDirectory:YES] includingPropertiesForKeys:@[] options:0 error:nil];
 
     for(NSURL* db_file in db_files) {
         if([[db_file pathExtension] isEqualToString:@"list"]) {
             NSString* content = [NSString stringWithContentsOfURL:db_file encoding:NSUTF8StringEncoding error:nil];
-
             if(content) {
-                // Read all lines
                 NSArray* lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-
                 for(NSString* line in lines) {
                     NSString* path = [self getStandardizedPath:line];
+                    if(!path || [path length] == 0 || [path isEqualToString:@"/"]) continue;
 
-                    if(!path || [path length] == 0 || [path isEqualToString:@"/"]) {
-                        continue;
-                    }
-
+                    // Handle App URLs for scheme hiding
                     if([[path pathExtension] isEqualToString:@"app"]) {
                         NSBundle* appBundle = [NSBundle bundleWithPath:[RootBridge getJBPath:path]];
-
                         if(appBundle) {
-                            NSDictionary* plist = [appBundle infoDictionary];
-                            NSDictionary* urltypes = [plist objectForKey:@"CFBundleURLTypes"];
-
+                            NSDictionary* urltypes = [[appBundle infoDictionary] objectForKey:@"CFBundleURLTypes"];
                             if(urltypes) {
                                 for(NSDictionary* type in urltypes) {
                                     NSArray* urlschemes = [type objectForKey:@"CFBundleURLSchemes"];
-
-                                    if(urlschemes) {
-                                        [schemes addObjectsFromArray:urlschemes];
-                                    }
+                                    if(urlschemes) [schemes addObjectsFromArray:urlschemes];
                                 }
                             }
                         }
                     }
-
-                    // if(ruleset && ![ruleset isPathCompliant:path]) {
-                    //     continue;
-                    // }
-                    
-                    if([db_list_skip containsObject:[db_file lastPathComponent]]) {
-                        [db_exception addObject:path];
-                    } else {
-                        [db_installed addObject:path];
-                    }
+                    [db_installed addObject:path];
                 }
             }
         }
     }
 
-    // filter installed ruleset
+    // Critical system exclusion list
     NSArray* filter_names = @[
         @"/.",
         @"/Library/Application Support",
         @"/usr/lib",
-        @"/usr/libexec",
-        @"/usr/lib/system",
         @"/var/mobile/Library/Caches",
-        @"/var/mobile/Media",
         @"/System/Library/PrivateFrameworks/CoreEmoji.framework",
-        @"/System/Library/PrivateFrameworks/CoreEmoji.framework/SearchEngineOverrideLists",
-        @"/System/Library/PrivateFrameworks/CoreEmoji.framework/SearchModel-en",
         @"/System/Library/PrivateFrameworks/TextInput.framework"
     ];
 
     [db_exception addObjectsFromArray:filter_names];
     [db_installed minusSet:db_exception];
 
-    NSPredicate* emoji = [NSPredicate predicateWithFormat:@"SELF LIKE '/System/Library/PrivateFrameworks/CoreEmoji.framework/*.lproj'"];
-    NSPredicate* not_emoji = [NSCompoundPredicate notPredicateWithSubpredicate:emoji];
-    
-    [db_installed filterUsingPredicate:not_emoji];
-
     return @{
         @"RulesetInfo" : @{
-            @"Name" : @"dpkg installed files",
+            @"Name" : @"dpkg installed files (Rootless Optimized)",
             @"Author" : @"Shadow Service"
         },
         @"BlacklistExactPaths" : [db_installed allObjects],
@@ -201,11 +145,9 @@ extern char*** _NSGetArgv();
         if([obj isKindOfClass:[NSString class]]) {
             return [shadow isPathRestricted:obj options:options] == _restricted;
         }
-        
         if([obj isKindOfClass:[NSURL class]]) {
             return [shadow isURLRestricted:obj options:options] == _restricted;
         }
-
         return NO;
     }];
 
