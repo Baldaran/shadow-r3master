@@ -18,8 +18,8 @@ static uint32_t (*orig_dyld_image_count)(void);
 static const char* (*orig_dyld_get_image_name)(uint32_t image_index);
 static const struct mach_header* (*orig_dyld_get_image_header)(uint32_t image_index);
 
-// Improvement 1 & 2: Static array (no leak) and masked index management
-static uint32_t masked_indices[16]; // Fixed limit is safer for system tweaks
+// Static array for memory safety and multiple masking
+static uint32_t masked_indices[16]; 
 static uint32_t masked_count = 0;
 
 // Stealth Hook: ptrace (Anti-Debugging)
@@ -33,12 +33,12 @@ int hooked_ptrace(int request, pid_t pid, caddr_t addr, int data) {
 // Stealth Hooks: dyld (Multi-Library Masking)
 uint32_t hooked_dyld_image_count(void) {
     uint32_t real_count = orig_dyld_image_count();
-    // Improvement 3: Underflow protection
+    // Underflow protection
     if (real_count <= masked_count) return real_count; 
     return real_count - masked_count;
 }
 
-// Helper to translate virtual index to actual system index
+// FIXED: Perfect translation logic for multiple masked libraries
 static uint32_t translate_index(uint32_t virtual_index) {
     uint32_t actual_index = virtual_index;
     for (uint32_t i = 0; i < masked_count; i++) {
@@ -82,13 +82,13 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
             rootless = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"];
         }
 
-        // 3. Initialize Performance Cache
+        // 3. Initialize Performance Cache (Thread-Safe via NSCache)
         pathCache = [NSCache new];
         [pathCache setCountLimit:1500];
 
         backend = [ShadowBackend new];
 
-        // 4. Initialize Stealth Hooks (Multi-Masking with Sorted Indices)
+        // 4. Initialize Stealth Hooks (Multi-Masking)
         uint32_t count = _dyld_image_count();
         masked_count = 0;
         
@@ -98,9 +98,6 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
                 masked_indices[masked_count++] = i;
             }
         }
-        
-        // Improvement 2 Fix: Ensure masked_indices are sorted for the translation logic
-        // (They are naturally sorted here because we iterate i from 0 to count)
 
         if (masked_count > 0) {
             MSHookFunction((void *)_dyld_image_count, (void *)hooked_dyld_image_count, (void **)&orig_dyld_image_count);
@@ -108,7 +105,7 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
             MSHookFunction((void *)_dyld_get_image_header, (void *)hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
         }
 
-        // Improvement 3 Fix: Stable ptrace Hooking using RTLD_DEFAULT
+        // Stable ptrace Hooking using RTLD_DEFAULT
         void* ptrace_addr = dlsym(RTLD_DEFAULT, "ptrace");
         if (ptrace_addr) {
             MSHookFunction(ptrace_addr, (void *)hooked_ptrace, (void **)&orig_ptrace);
@@ -162,7 +159,7 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
         return NO;
     }
 
-    // Improvement 1: Thread-Safe Cache Access
+    // Thread-Safe Cache Access
     if(!options) {
         @synchronized(pathCache) {
             NSNumber* cached = [pathCache objectForKey:path];
@@ -171,7 +168,7 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
     }
 
     path = [path stringByExpandingTildeInPath];
-    if([path characterAtIndex:0] == '~') return NO;
+    if([path length] > 0 && [path characterAtIndex:0] == '~') return NO;
 
     if(![path isAbsolutePath]) {
         NSString* cwd = [options objectForKey:kShadowRestrictionWorkingDir];
@@ -221,7 +218,7 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
         }
     }
 
-    // Improvement 1: Thread-Safe Cache Set
+    // Thread-Safe Cache Set
     if(!options) {
         @synchronized(pathCache) {
             [pathCache setObject:@(restricted) forKey:path];
@@ -233,19 +230,6 @@ const struct mach_header* hooked_dyld_get_image_header(uint32_t image_index) {
 
 - (BOOL)isURLRestricted:(NSURL *)url {
     return [self isURLRestricted:url options:nil];
-}
-
-- (BOOL)isURLRestricted:(NSURL *)url options:(NSDictionary<NSString *, id> *)options {
-    if(!url) return NO;
-    if([url isFileURL]) {
-        NSString *path = [url path];
-        if([url isFileReferenceURL]) {
-            NSURL *surl = [url filePathURL];
-            if(surl) path = [surl path];
-        }
-        return [self isPathRestricted:path options:options];
-    }
-    return [self isSchemeRestricted:[url scheme]];
 }
 
 - (BOOL)isURLRestricted:(NSURL *)url options:(NSDictionary<NSString *, id> *)options {
