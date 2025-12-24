@@ -6,7 +6,11 @@
 #import <pwd.h>
 #import "../vendor/apple/dyld_priv.h"
 
-@implementation Shadow
+@implementation Shadow {
+    // Advanced Memory Cache for high-speed lookups
+    NSCache* pathCache;
+}
+
 @synthesize bundlePath, homePath, realHomePath, hasAppSandbox, rootless;
 
 - (instancetype)init {
@@ -21,11 +25,15 @@
 
         hasAppSandbox = [[bundlePath pathExtension] isEqualToString:@"app"];
         
-        // Hardened Rootless Detection for iOS 16
+        // Rootless Detection
         rootless = [RootBridge isJBRootless];
         if(!rootless) {
             rootless = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"];
         }
+
+        // Initialize Performance Cache
+        pathCache = [NSCache new];
+        [pathCache setCountLimit:1500]; // Optimal balance for iOS 16 RAM management
 
         backend = [ShadowBackend new];
     }
@@ -43,14 +51,13 @@
 }
 
 - (BOOL)isAddrExternal:(const void *)addr {
-    if(addr) {
-        const char* image_path = dyld_image_path_containing_address(addr);
-        if(image_path) {
-            if(strstr(image_path, [bundlePath fileSystemRepresentation]) != NULL) {
-                return NO;
-            }
-            return YES;
+    if(!addr) return NO;
+    const char* image_path = dyld_image_path_containing_address(addr);
+    if(image_path) {
+        if(strstr(image_path, [bundlePath fileSystemRepresentation]) != NULL) {
+            return NO;
         }
+        return YES;
     }
     return NO;
 }
@@ -79,6 +86,12 @@
         return NO;
     }
 
+    // Performance Shortcut: Check Memory Cache first
+    if(!options) {
+        NSNumber* cached = [pathCache objectForKey:path];
+        if(cached) return [cached boolValue];
+    }
+
     path = [path stringByExpandingTildeInPath];
     if([path characterAtIndex:0] == '~') return NO;
 
@@ -92,6 +105,7 @@
 
     path = [[self class] getStandardizedPath:path];
     BOOL shouldCheckPath = (!hasAppSandbox || (![path hasPrefix:bundlePath] && ![path hasPrefix:homePath]));
+    BOOL restricted = NO;
 
     if(shouldCheckPath) {
         NSString* file_ext = [options objectForKey:kShadowRestrictionFileExtension];
@@ -99,45 +113,44 @@
             path = [path stringByAppendingFormat:@".%@", file_ext];
         }
 
-        // --- ROOTLESS OPTIMIZATION BLOCK ---
         if(rootless) {
-            // Explicitly restrict the jb-root
             if([path hasPrefix:@"/var/jb"] || [path hasPrefix:@"/private/preboot/"]) {
-                return YES;
+                restricted = YES;
+            } else if(![path hasPrefix:@"/var"] && ![path hasPrefix:@"/private/preboot"] && ![path hasPrefix:@"/usr/lib"]) {
+                restricted = NO;
+            } else if([backend isPathRestricted:path]) {
+                restricted = YES;
             }
-            
-            // Allow standard system paths to skip heavy backend checks
-            if(![path hasPrefix:@"/var"] && ![path hasPrefix:@"/private/preboot"] && ![path hasPrefix:@"/usr/lib"]) {
-                return NO;
-            }
+        } else if([backend isPathRestricted:path]) {
+            restricted = YES;
         }
-        // ------------------------------------
 
-        if([path hasPrefix:@"/usr/lib"]) {
+        // Special handling for dynamic library paths
+        if(!restricted && [path hasPrefix:@"/usr/lib"]) {
             int errno_old = errno;
             if(access([path fileSystemRepresentation], F_OK) != 0) {
                 errno = errno_old;
-                return NO;
+                restricted = NO;
             }
-        }
-
-        if([backend isPathRestricted:path]) {
-            return YES;
         }
     }
 
-    if(![options objectForKey:kShadowRestrictionEnableResolve] || [[options objectForKey:kShadowRestrictionEnableResolve] boolValue]) {
+    // Recursive Resolve
+    if(!restricted && (![options objectForKey:kShadowRestrictionEnableResolve] || [[options objectForKey:kShadowRestrictionEnableResolve] boolValue])) {
         NSString* resolved_path = [path stringByStandardizingPath];
         if(![resolved_path isEqualToString:path]) {
             NSMutableDictionary* opt = [NSMutableDictionary dictionaryWithDictionary:options];
             [opt setObject:@(NO) forKey:kShadowRestrictionEnableResolve];
-            if([self isPathRestricted:resolved_path options:[opt copy]]) {
-                return YES;
-            }
+            restricted = [self isPathRestricted:resolved_path options:[opt copy]];
         }
     }
 
-    return NO;
+    // Save result to Cache for next time
+    if(!options) {
+        [pathCache setObject:@(restricted) forKey:path];
+    }
+
+    return restricted;
 }
 
 - (BOOL)isURLRestricted:(NSURL *)url {
