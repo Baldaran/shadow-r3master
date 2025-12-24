@@ -1,92 +1,96 @@
 #import <Shadow/Ruleset.h>
 
-@implementation ShadowRuleset
+@implementation ShadowRuleset {
+    // Background sets for fast O(1) lookups
+    NSSet* set_urlschemes;
+    NSSet* set_whitelist;
+    NSSet* set_blacklist;
+
+    // Compound predicates for complex rules
+    NSCompoundPredicate* pred_whitelist;
+    NSCompoundPredicate* pred_blacklist;
+    
+    // Arrays for prefix matching
+    NSArray* array_whitelist;
+    NSArray* array_blacklist;
+}
+
 @synthesize internalDictionary;
 
 - (instancetype)init {
     if((self = [super init])) {
-        set_urlschemes = nil;
-        set_whitelist = nil;
-        set_blacklist = nil;
-
-        pred_whitelist = nil;
-        pred_blacklist = nil;
+        // Initializing with empty sets prevents nil-pointer checks later
+        set_urlschemes = [NSSet new];
+        set_whitelist = [NSSet new];
+        set_blacklist = [NSSet new];
     }
-
     return self;
 }
 
 + (instancetype)rulesetWithURL:(NSURL *)url {
     NSDictionary* ruleset_dict = [NSDictionary dictionaryWithContentsOfURL:url];
-
     if(ruleset_dict) {
         ShadowRuleset* ruleset = [self new];
         [ruleset setInternalDictionary:ruleset_dict];
         [ruleset _compile];
         return ruleset;
     }
-
     return nil;
 }
 
 + (instancetype)rulesetWithPath:(NSString *)path {
-    NSURL* file_url = [NSURL fileURLWithPath:path isDirectory:NO];
-    return [self rulesetWithURL:file_url];
+    return [self rulesetWithURL:[NSURL fileURLWithPath:path isDirectory:NO]];
 }
 
 - (void)_compile {
+    // We use a high-priority queue but wait for essential sets to finish 
+    // to ensure the bypass is active before the first path check.
     NSOperationQueue* queue = [NSOperationQueue new];
     [queue setQualityOfService:NSOperationQualityOfServiceUserInteractive];
 
-    NSArray* urlschemes = [internalDictionary objectForKey:@"BlacklistURLSchemes"];
-
-    if(urlschemes) {
+    // 1. URL Schemes
+    NSArray* schemes = internalDictionary[@"BlacklistURLSchemes"];
+    if(schemes) {
         [queue addOperationWithBlock:^{
-            set_urlschemes = [NSSet setWithArray:urlschemes];
+            self->set_urlschemes = [NSSet setWithArray:schemes];
         }];
     }
 
-    NSArray* whitelist_paths = [internalDictionary objectForKey:@"WhitelistExactPaths"];
-
-    if(whitelist_paths) {
+    // 2. Exact Path Sets
+    NSArray* wl_exact = internalDictionary[@"WhitelistExactPaths"];
+    if(wl_exact) {
         [queue addOperationWithBlock:^{
-            set_whitelist = [NSSet setWithArray:whitelist_paths];
+            self->set_whitelist = [NSSet setWithArray:wl_exact];
         }];
     }
 
-    NSArray* blacklist_paths = [internalDictionary objectForKey:@"BlacklistExactPaths"];
-
-    if(blacklist_paths) {
+    NSArray* bl_exact = internalDictionary[@"BlacklistExactPaths"];
+    if(bl_exact) {
         [queue addOperationWithBlock:^{
-            set_blacklist = [NSSet setWithArray:blacklist_paths];
+            self->set_blacklist = [NSSet setWithArray:bl_exact];
         }];
     }
 
-    NSArray* whitelist_preds = [internalDictionary objectForKey:@"WhitelistPredicates"];
+    // 3. Prefix Arrays (Pre-cached for performance)
+    array_whitelist = internalDictionary[@"WhitelistPaths"];
+    array_blacklist = internalDictionary[@"BlacklistPaths"];
 
-    if(whitelist_preds) {
+    // 4. Predicate Compilation (The heaviest task)
+    NSArray* wl_preds = internalDictionary[@"WhitelistPredicates"];
+    if(wl_preds) {
         [queue addOperationWithBlock:^{
-            NSMutableArray<NSPredicate *>* preds = [NSMutableArray new];
-
-            for(NSString* pred_str in whitelist_preds) {
-                [preds addObject:[NSPredicate predicateWithFormat:pred_str]];
-            }
-
-            pred_whitelist = [NSCompoundPredicate orPredicateWithSubpredicates:preds];
+            NSMutableArray* preds = [NSMutableArray new];
+            for(NSString* ps in wl_preds) [preds addObject:[NSPredicate predicateWithFormat:ps]];
+            self->pred_whitelist = [NSCompoundPredicate orPredicateWithSubpredicates:preds];
         }];
     }
 
-    NSArray* blacklist_preds = [internalDictionary objectForKey:@"BlacklistPredicates"];
-
-    if(blacklist_preds) {
+    NSArray* bl_preds = internalDictionary[@"BlacklistPredicates"];
+    if(bl_preds) {
         [queue addOperationWithBlock:^{
-            NSMutableArray<NSPredicate *>* preds = [NSMutableArray new];
-
-            for(NSString* pred_str in blacklist_preds) {
-                [preds addObject:[NSPredicate predicateWithFormat:pred_str]];
-            }
-
-            pred_blacklist = [NSCompoundPredicate orPredicateWithSubpredicates:preds];
+            NSMutableArray* preds = [NSMutableArray new];
+            for(NSString* ps in bl_preds) [preds addObject:[NSPredicate predicateWithFormat:ps]];
+            self->pred_blacklist = [NSCompoundPredicate orPredicateWithSubpredicates:preds];
         }];
     }
 
@@ -94,78 +98,56 @@
 }
 
 - (BOOL)isPathCompliant:(NSString *)path {
-    NSDictionary* structure = [internalDictionary objectForKey:@"FileSystemStructure"];
+    NSDictionary* structure = internalDictionary[@"FileSystemStructure"];
+    if(!structure || structure[path]) return YES;
 
-    // Skip checks if ruleset doesn't define a structure or if path is a key.
-    if(!structure || [structure objectForKey:path]) {
-        return YES;
-    }
-
-    // Find the closest key in the structure.
     NSString* path_tmp = path;
     NSArray* structure_base = nil;
 
+    // Walk up the tree to find the nearest enforcement point
     do {
         path_tmp = [path_tmp stringByDeletingLastPathComponent];
-        structure_base = [structure objectForKey:path_tmp];
+        structure_base = structure[path_tmp];
     } while(!structure_base && ![path_tmp isEqualToString:@"/"]);
 
-    // Check if path begins with any of the structure's child paths.
     if(structure_base) {
-        BOOL compliant = NO;
-
         for(NSString* name in structure_base) {
-            NSString* structure_path = [path_tmp stringByAppendingPathComponent:name];
-
-            if([path hasPrefix:structure_path]) {
-                compliant = YES;
-                break;
-            }
+            if([path hasPrefix:[path_tmp stringByAppendingPathComponent:name]]) return YES;
         }
-
-        return compliant;
+        return NO;
     }
-
     return YES;
 }
 
 - (BOOL)isPathWhitelisted:(NSString *)path {
-    if([set_whitelist containsObject:path] || [pred_whitelist evaluateWithObject:path]) {
-        return YES;
+    // 1. Check Exact Set (Fastest)
+    if([set_whitelist containsObject:path]) return YES;
+
+    // 2. Check Prefix Array
+    for(NSString* wl_path in array_whitelist) {
+        if([path hasPrefix:wl_path]) return YES;
     }
 
-    NSArray* array_whitelist = [internalDictionary objectForKey:@"WhitelistPaths"];
-
-    if(array_whitelist) {
-        for(NSString* whitelist_path in array_whitelist) {
-            if([path hasPrefix:whitelist_path]) {
-                return YES;
-            }
-        }
-    }
-
-    return NO;
+    // 3. Check Predicates (Slowest)
+    return [pred_whitelist evaluateWithObject:path];
 }
 
 - (BOOL)isPathBlacklisted:(NSString *)path {
-    if([set_blacklist containsObject:path] || [pred_blacklist evaluateWithObject:path]) {
-        return YES;
+    // 1. Check Exact Set (Fastest)
+    if([set_blacklist containsObject:path]) return YES;
+
+    // 2. Check Prefix Array
+    for(NSString* bl_path in array_blacklist) {
+        if([path hasPrefix:bl_path]) return YES;
     }
 
-    NSArray* array_blacklist = [internalDictionary objectForKey:@"BlacklistPaths"];
-
-    if(array_blacklist) {
-        for(NSString* blacklist_path in array_blacklist) {
-            if([path hasPrefix:blacklist_path]) {
-                return YES;
-            }
-        }
-    }
-
-    return NO;
+    // 3. Check Predicates (Slowest)
+    return [pred_blacklist evaluateWithObject:path];
 }
 
 - (BOOL)isSchemeRestricted:(NSString *)scheme {
+    if(!scheme) return NO;
     return [set_urlschemes containsObject:scheme];
 }
+
 @end
