@@ -7,6 +7,7 @@
 
 - (instancetype)init {
     if((self = [super init])) {
+        // Define original default behavior
         defaultSettings = @{
             @"Global_Enabled" : @(NO),
             @"HK_Library" : @"fishhook",
@@ -30,7 +31,12 @@
             @"Hook_HideApps" : @(NO)
         };
 
-        userDefaults = [[NSUserDefaults alloc] initWithSuiteName:@SHADOW_PREFS_PLIST];
+        // iOS 16 Rootless optimization:
+        // Use RootBridge to locate the preference file path correctly
+        NSString* prefPath = [RootBridge rootPath:@SHADOW_PREFS_PLIST];
+        
+        // Initialize userDefaults using the corrected path for rootless environments
+        userDefaults = [[NSUserDefaults alloc] initWithSuiteName:prefPath];
         [userDefaults registerDefaults:defaultSettings];
     }
 
@@ -50,7 +56,7 @@
 
 - (NSDictionary<NSString *, id> *)getPreferencesForIdentifier:(NSString *)bundleIdentifier {
     if(!userDefaults) {
-        return nil;
+        return defaultSettings;
     }
 
     NSMutableDictionary* result = [defaultSettings mutableCopy];
@@ -83,7 +89,10 @@
             [result setObject:@(YES) forKey:@"App_Enabled"];
 
             for(NSString* key in defaultSettings) {
-                [result setObject:[userDefaults objectForKey:key] forKey:key];
+                id value = [userDefaults objectForKey:key];
+                if(value) {
+                    [result setObject:value forKey:key];
+                }
             }
         }
     }
