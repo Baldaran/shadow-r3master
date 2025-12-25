@@ -1,18 +1,44 @@
 #import "hooks.h"
 
-// %group shadowhook_objc
-// %hook NSObject
-// + (Class)class {
-//     Class result = %orig;
+// --- Logos Hooks for Foundation Classes ---
+// High-level ObjC detection usually happens here.
+%group shadow_objc_foundation
+%hook NSFileManager
+- (BOOL)fileExistsAtPath:(NSString *)path {
+    if (!isCallerTweak() && [_shadow isPathRestricted:path]) {
+        return NO;
+    }
+    return %orig;
+}
 
-//     if(!isCallerTweak() && [_shadow isAddrRestricted:(__bridge const void *)result]) {
-//         return nil;
-//     }
+- (BOOL)isReadableFileAtPath:(NSString *)path {
+    if (!isCallerTweak() && [_shadow isPathRestricted:path]) {
+        return NO;
+    }
+    return %orig;
+}
 
-//     return result;
-// }
-// %end
-// %end
+- (BOOL)isDeletableFileAtPath:(NSString *)path {
+    if (!isCallerTweak() && [_shadow isPathRestricted:path]) {
+        return NO;
+    }
+    return %orig;
+}
+%end
+
+%hook NSString
+- (BOOL)writeToFile:(NSString *)path atomically:(BOOL)useAuxiliaryFile encoding:(NSStringEncoding)enc error:(NSError **)error {
+    if (!isCallerTweak() && [_shadow isPathRestricted:path]) {
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteNoPermissionError userInfo:nil];
+        return NO;
+    }
+    return %orig;
+}
+%end
+%end
+
+// --- C-Function Hooks for ObjC Runtime ---
+// Advanced detection looks at the loaded classes and images.
 
 static const char* (*original_class_getImageName)(Class cls);
 static const char* replaced_class_getImageName(Class cls) {
@@ -22,6 +48,7 @@ static const char* replaced_class_getImageName(Class cls) {
         return result;
     }
 
+    // If the class belongs to a tweak, claim it belongs to the main app binary instead.
     return [[Shadow getExecutablePath] fileSystemRepresentation];
 }
 
@@ -33,13 +60,10 @@ static const char * _Nonnull * replaced_objc_copyImageNames(unsigned int *outCou
         return result;
     }
 
+    // Filtering logic: only show images up to the main executable to hide injected dylibs.
     const char* exec_name = _dyld_get_image_name(0);
-    unsigned int i;
-
-    for(i = 0; i < *outCount; i++) {
+    for(unsigned int i = 0; i < *outCount; i++) {
         if(strcmp(result[i], exec_name) == 0) {
-            // Stop after app executable.
-            // todo: improve this to filter instead
             *outCount = (i + 1);
             break;
         }
@@ -48,19 +72,11 @@ static const char * _Nonnull * replaced_objc_copyImageNames(unsigned int *outCou
     return result;
 }
 
-static const char * _Nonnull * (*original_objc_copyClassNamesForImage)(const char* image, unsigned int *outCount);
-static const char * _Nonnull * replaced_objc_copyClassNamesForImage(const char* image, unsigned int *outCount) {
-    if(isCallerTweak() || ![_shadow isCPathRestricted:image]) {
-        return original_objc_copyClassNamesForImage(image, outCount);
-    }
-
-    return NULL;
-}
-
 static Class (*original_NSClassFromString)(NSString* aClassName);
 static Class replaced_NSClassFromString(NSString* aClassName) {
     Class result = original_NSClassFromString(aClassName);
 
+    // If an app asks for a class like "Shadow_Hook", we return nil if that class's address is restricted.
     if(isCallerTweak() || ![_shadow isAddrRestricted:(__bridge const void *)result]) {
         return result;
     }
@@ -68,43 +84,23 @@ static Class replaced_NSClassFromString(NSString* aClassName) {
     return nil;
 }
 
-typedef struct _NXMapTable NXMapTable;
-typedef struct _NXHashTable NXHashTable;
-
-extern void* NXMapGet(NXMapTable *table, const char *name);
-extern void* NXHashGet(NXHashTable *table, const void *data);
-
-static void* (*original_NXMapGet)(NXMapTable *table, const char *name);
-static void* replaced_NXMapGet(NXMapTable *table, const char *name) {
-    void* result = original_NXMapGet(table, name);
-
-    if(isCallerTweak() || ![_shadow isAddrRestricted:result]) {
-        return result;
-    }
-
-    return nil;
-}
-
-static void* (*original_NXHashGet)(NXHashTable *table, const void *data);
-static void* replaced_NXHashGet(NXHashTable *table, const void *data) {
-    void* result = original_NXHashGet(table, data);
-
-    if(isCallerTweak() || ![_shadow isAddrRestricted:result]) {
-        return result;
-    }
-
-    return nil;
-}
+// --- Initialization Entry Points ---
 
 void shadowhook_objc(HKSubstitutor* hooks) {
-    // %init(shadowhook_objc);
+    // 1. Initialize Logos Group
+    %init(shadow_objc_foundation);
+
+    // 2. Hook Runtime C-Functions using HookKit
     MSHookFunction(class_getImageName, replaced_class_getImageName, (void **) &original_class_getImageName);
-    MSHookFunction(objc_copyClassNamesForImage, replaced_objc_copyClassNamesForImage, (void **) &original_objc_copyClassNamesForImage);
     MSHookFunction(objc_copyImageNames, replaced_objc_copyImageNames, (void **) &original_objc_copyImageNames);
+    
+    // Note: objc_copyClassNamesForImage is omitted as it's often redundant 
+    // when class_getImageName is correctly handled.
 }
 
 void shadowhook_objc_hidetweakclasses(HKSubstitutor* hooks) {
     MSHookFunction(NSClassFromString, replaced_NSClassFromString, (void **) &original_NSClassFromString);
-    MSHookFunction(NXMapGet, replaced_NXMapGet, (void **) &original_NXMapGet);
-    MSHookFunction(NXHashGet, replaced_NXHashGet, (void **) &original_NXHashGet);
+    
+    // Note: NXMapGet and NXHashGet are extremely low-level and high-frequency.
+    // Only enable if specifically targeted by an anti-cheat, as they can impact performance.
 }
