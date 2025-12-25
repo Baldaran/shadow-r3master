@@ -1,33 +1,31 @@
+# Target architecture and SDK
+TARGET := iphone:clang:latest:14.0
+INSTALL_TARGET_PROCESSES = SpringBoard
+ARCHS = arm64 arm64e
+
 include $(THEOS)/makefiles/common.mk
 
-FRAMEWORK_NAME = Shadow
+TWEAK_NAME = Shadow
 
-# 1. Implementation Files
-# Included Backend.m as per your project structure
-Shadow_FILES = Core.m Core+Utilities.m Backend.m Ruleset.m Settings.m
+# 1. Source Files
+# This automatically finds your dylib.x and every .x/.m file inside the hooks folder
+Shadow_FILES = dylib.x $(wildcard hooks/*.x) $(wildcard hooks/*.m)
 
-# 2. Framework Dependencies
-Shadow_FRAMEWORKS = Foundation CoreFoundation
-Shadow_EXTRA_FRAMEWORKS = RootBridge
+# 2. Frameworks and Libraries
+# We link against our own Shadow.framework and the helper libraries
+Shadow_FRAMEWORKS = UIKit CoreFoundation Foundation Security
+Shadow_EXTRA_FRAMEWORKS = Shadow
+Shadow_LIBRARIES = HookKit Sandy RootBridge
 
-# 3. Installation Path (Standard for iOS Frameworks)
-Shadow_INSTALL_PATH = /Library/Frameworks
+# 3. Compiler Flags
+# -I allows the compiler to find your internal headers
+# -fobjc-arc enables Automatic Reference Counting
+Shadow_CFLAGS = -fobjc-arc -Iinclude -I../framework/include -I.
+Shadow_LDFLAGS = -L../framework/binaries -rpath /Library/Frameworks -rpath /var/jb/Library/Frameworks
 
-# 4. Compiler Flags
-# Added -I. and standardized lowercase 'headers' path
-Shadow_CFLAGS = -fobjc-arc -I. -Iheaders -I../ -I../vendor/RootBridge.framework/Headers
+include $(THEOS_MAKE_PATH)/tweak.mk
 
-# 5. Linker Flags
-# Optimized for Library Masking (CydiaSubstrate) and RPATH resolution
-Shadow_LDFLAGS = -lsubstrate -F../vendor/ -install_name @rpath/Shadow.framework/Shadow
-
-# Add multiple search paths for the dynamic linker (essential for iOS 16 Rootless)
-Shadow_LDFLAGS += -rpath /Library/Frameworks \
-                  -rpath /var/jb/Library/Frameworks \
-                  -rpath /usr/lib \
-                  -rpath /var/jb/usr/lib
-
-# Include any global flags defined in common.mk
-Shadow_LDFLAGS += $(COMMON_LDFLAGS)
-
-include $(THEOS_MAKE_PATH)/framework.mk
+# 4. Subprojects
+# This ensures that when you type 'make', it also builds your Settings bundle and Framework
+SUBPROJECTS += ../framework ../shdw
+include $(THEOS_MAKE_PATH)/aggregate.mk
