@@ -1,1 +1,9 @@
-{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }
+{
+    Filter = {
+        Bundles = (
+            "com.apple.UIKit",
+            "com.apple.springboard"
+        );
+        Mode = "Any";
+    };
+}
