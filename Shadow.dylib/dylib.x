@@ -8,24 +8,21 @@
 #import <HookKit.h>
 #import <RootBridge.h>
 
+// Global instance for hooks to use
+Shadow* _shadow = nil;
+
 %group hook_springboard
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
 
-    // Use a background queue with utility priority to avoid stuttering SpringBoard
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+    // Background database refresh (Maintenance)
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_UTILITY, 0), ^{
         NSDictionary* ruleset_dpkg = [Shadow generateDatabase];
-
         if(ruleset_dpkg) {
             NSString* dbPath = [RootBridge getJBPath:@(SHADOW_DB_PLIST)];
-            BOOL success = [ruleset_dpkg writeToFile:dbPath atomically:YES];
-
-            if(success) {
-                NSLog(@"[Shadow] Successfully updated ruleset database at %@", dbPath);
-            } else {
-                NSLog(@"[Shadow] Error: Failed to write ruleset to %@", dbPath);
-            }
+            [ruleset_dpkg writeToFile:dbPath atomically:YES];
+            NSLog(@"[Shadow] Global ruleset database updated.");
         }
     });
 }
@@ -33,83 +30,91 @@
 %end
 
 %ctor {
-    // 1. Identification
+    // 1. Setup Identity
     NSString* bundleIdentifier = [Shadow getBundleIdentifier];
     NSString* executablePath = [Shadow getExecutablePath];
 
-    // 2. SpringBoard Handling (Database Maintenance)
+    // 2. SpringBoard Maintenance Mode
     if([bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
         %init(hook_springboard);
         return;
     }
 
-    // 3. Early Exit Strategy (Bypass System Processes & Known Tools)
-    if(!executablePath || [executablePath hasPrefix:@"/System"] || [executablePath hasPrefix:@"/usr/libexec"]) {
-        return;
-    }
-
-    // Identify if we are in a standard App bundle
-    BOOL isApp = [[executablePath stringByDeletingLastPathComponent] hasSuffix:@".app"];
-    if(!isApp) return;
-
-    // Filter out Jailbreak management apps and Apple system apps
-    NSArray* excludedPrefixes = @[@"com.opa334", @"org.coolstar", @"science.xnu", @"com.apple.", @"com.samiiau", @"com.llsc12"];
-    for (NSString* prefix in excludedPrefixes) {
-        if ([bundleIdentifier hasPrefix:prefix]) return;
-    }
-
-    // 4. Sandbox Extension (iOS 11+)
-    if(kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_11_0) {
-        if (libSandy_applyProfile("ShadowSettings") != 0) {
-            NSLog(@"[Shadow] Warning: libSandy failed to apply profile.");
-        }
-    }
-
-    // 5. Load Preferences via our refined Settings Engine
-    NSDictionary* prefs_load = [[ShadowSettings sharedInstance] getPreferencesForIdentifier:bundleIdentifier];
-    if(!prefs_load || ![prefs_load[@"App_Enabled"] boolValue]) {
-        return;
-    }
-
-    NSLog(@"[Shadow] Initializing bypass for: %@", bundleIdentifier);
-
-    // 6. HookKit Setup
-    HKSubstitutor* substitutor = [HKSubstitutor defaultSubstitutor];
-    #ifdef hookkit_h
-    if(prefs_load[@"HK_Library"] && ![prefs_load[@"HK_Library"] isEqualToString:@"auto"]) {
-        // Logic to set preferred hook library (Substrate/Substitute/Cydia)
-        // ... (Keep your existing HK logic here)
-    }
-    HKEnableBatching();
-    #endif
-
-    // 7. Execute Hooks based on Preferences
-    // (Consolidated logic for cleaner execution)
+    // 3. Smart Filter: Ignore system daemons and self
+    if(!executablePath || [executablePath hasPrefix:@"/System"] || [executablePath hasPrefix:@"/usr/libexec"]) return;
     
-    if([prefs_load[@"Hook_Filesystem"] boolValue]) {
-        shadowhook_libc(substitutor);
-        shadowhook_NSFileManager(substitutor);
-        // ... rest of filesystem hooks
+    // Ensure we are in an actual .app container
+    if(![executablePath containsString:@".app/"]) return;
+
+    // Fast-exit for excluded identifiers
+    static NSSet* excludedIdentifiers;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        excludedIdentifiers = [NSSet setWithObjects:@"com.apple.mobilesafari", @"com.samiiau.shadow", @"com.opa334.Dopamine", nil];
+    });
+    
+    if([excludedIdentifiers containsObject:bundleIdentifier] || [bundleIdentifier hasPrefix:@"com.apple."]) return;
+
+    // 4. Load Preferences & Sandbox
+    NSDictionary* prefs = [[ShadowSettings sharedInstance] getPreferencesForIdentifier:bundleIdentifier];
+    if(![prefs[@"App_Enabled"] boolValue]) return;
+
+    // Initialize the Shadow Instance
+    _shadow = [Shadow sharedInstance];
+
+    // Apply libSandy profile to read settings in restricted sandboxes
+    if(kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_11_0) {
+        libSandy_applyProfile("ShadowSettings");
     }
 
-    if([prefs_load[@"Hook_EnvVars"] boolValue]) {
-        // Environment Sanitization
-        NSArray* safe_envvars = @[@"HOME", @"PATH", @"USER", @"TMPDIR", @"SHELL"];
-        NSDictionary* procEnv = [[NSProcessInfo processInfo] environment];
-        for(NSString* envvar in procEnv) {
-            if(![safe_envvars containsObject:envvar]) {
-                unsetenv([envvar UTF8String]);
-            }
+    NSLog(@"[Shadow] Injecting into: %@", bundleIdentifier);
+
+    // 5. Initialize HookKit
+    HKSubstitutor* substitutor = [HKSubstitutor defaultSubstitutor];
+    
+    // Enable Batching for extreme speed (reduces system call overhead)
+    HKEnableBatching();
+
+    // 6. Core Hooks Execution
+    // Every hook group we defined in hooks.h is triggered here based on user settings
+    
+    if([prefs[@"Hook_Filesystem"] boolValue]) {
+        shadowhook_libc(substitutor);
+        shadowhook_libc_lowlevel(substitutor);
+        shadowhook_NSFileManager(substitutor);
+        shadowhook_NSFileHandle(substitutor);
+    }
+
+    if([prefs[@"Hook_ObjC"] boolValue]) {
+        shadowhook_objc(substitutor);
+        if([prefs[@"Hook_TweakClasses"] boolValue]) {
+            shadowhook_objc_hidetweakclasses(substitutor);
         }
+    }
+
+    if([prefs[@"Hook_DynamicLibraries"] boolValue]) {
+        shadowhook_dyld(substitutor);
+        shadowhook_dyld_extra(substitutor);
+    }
+
+    if([prefs[@"Hook_FakeMac"] boolValue]) {
+        shadowhook_NSProcessInfo_fakemac(substitutor);
+    }
+
+    if([prefs[@"Hook_AntiDebugging"] boolValue]) {
+        shadowhook_libc_antidebugging(substitutor);
+    }
+
+    if([prefs[@"Hook_EnvVars"] boolValue]) {
+        shadowhook_libc_envvar(substitutor);
+        // Sanitize environment immediately
+        unsetenv("DYLD_INSERT_LIBRARIES");
         setenv("SHELL", "/bin/sh", 1);
     }
 
-    // ... All other hook triggers (DynamicLibraries, URLScheme, etc.)
-
-    #ifdef hookkit_h
+    // 7. Commit & Clean up
     HKExecuteBatch();
     HKDisableBatching();
-    #endif
 
-    NSLog(@"[Shadow] Hooks completed successfully.");
+    NSLog(@"[Shadow] All bypass hooks committed.");
 }
