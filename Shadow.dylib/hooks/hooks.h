@@ -1,6 +1,10 @@
+#ifndef SHADOW_HOOKS_H
+#define SHADOW_HOOKS_H
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
+// --- System Headers ---
 #import <stdio.h>
 #import <sys/stat.h>
 #import <sys/statvfs.h>
@@ -27,30 +31,40 @@
 #import <spawn.h>
 #import <objc/runtime.h>
 
+// --- Project Headers ---
 #import "../../common.h"
-#import <Shadow.h>
+#import <Shadow/Shadow.h>
 
+// --- Hooking Engines ---
 #import <substrate.h>
 #import <HookKit.h>
 
-// HookKit overrides
+// 1. Senior HookKit Mapping
+// This allows your 888-line libc.x to use MSHookFunction while actually calling HookKit.
 #ifdef hookkit_h
-#define MSHookFunction(a,b,c)   [hooks hookFunction:a withReplacement:b outOldPtr:c]
-#define MSHookMessageEx         HKHookMessage
-#define MSGetImageByName        HKOpenImage
-#define MSFindSymbol            HKFindSymbol
-#define MSCloseImage            HKCloseImage
+    #undef MSHookFunction
+    #define MSHookFunction(a,b,c) [hooks hookFunction:(void *)a withReplacement:(void *)b outOldPtr:(void **)c]
+    #define MSHookMessageEx       HKHookMessage
+    #define MSGetImageByName      HKOpenImage
+    #define MSFindSymbol          HKFindSymbol
+    #define MSCloseImage          HKCloseImage
 #endif
 
-// private symbols
+// 2. Private Apple Symbols (Ensure these files exist in your vendor path)
 #import "../../vendor/apple/dyld_priv.h"
 #import "../../vendor/apple/codesign.h"
 #import "../../vendor/apple/ptrace.h"
 
-#define _shadow                 [Shadow sharedInstance]
+// 3. Global Instance Reference
+// This ensures that 'Shadow.dylib' and all 'hooks/*.x' files use the SAME object.
+extern Shadow* _shadow;
 
-#define isCallerTweak()         [_shadow isAddrExternal:__builtin_extract_return_addr(__builtin_return_address(0))]
+// 4. PAC-Safe Caller Check (Your Original Optimized Logic)
+#ifndef isCallerTweak
+#define isCallerTweak() [[Shadow sharedInstance] isAddrExternal:__builtin_extract_return_addr(__builtin_return_address(0))]
+#endif
 
+// 5. Hook Group Declarations (The Namespace)
 extern void shadowhook_DeviceCheck(HKSubstitutor* hooks);
 extern void shadowhook_dyld(HKSubstitutor* hooks);
 extern void shadowhook_libc(HKSubstitutor* hooks);
@@ -82,3 +96,5 @@ extern void shadowhook_mem(HKSubstitutor* hooks);
 extern void shadowhook_objc_hidetweakclasses(HKSubstitutor* hooks);
 extern void shadowhook_LSApplicationWorkspace(HKSubstitutor* hooks);
 extern void shadowhook_NSThread(HKSubstitutor* hooks);
+
+#endif /* SHADOW_HOOKS_H */
